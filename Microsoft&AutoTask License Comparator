@@ -1,0 +1,420 @@
+<#
+Creator: ScriptDeBurger
+Date: 21-12-2021
+
+Description:
+
+The pupose of this script is to compare the Microsoft licenses with the AutoTask contracts from the tenants.
+It will create a report with all the diffences and send it to the Microsoft account you login with. 
+
+#>
+#==================Microsoft==================#
+
+# Establish a PowerShell session with Office 365. You'll be prompted for your Delegated Admin credentials.
+
+$MicrosoftCredentials = Get-Credential -Message "Please enter your Microsoft credentials."
+
+Connect-MsolService -Credential $MicrosoftCredentials
+
+# Getting all Customers TenantId.
+$Customers = Get-MsolPartnerContract -All
+
+# Erase all variable information.
+[array]$MicrosoftArrayLicenses  = $null
+[array]$InactiveLicenses        = $null
+
+# Import the Excel Sheet with the translated names.
+$Excel = Import-Csv '<Path To LicenseSort.csv>' 
+
+# Function to translate the Microsoft License names to AutoTask Contract names.
+function LicenseSort{
+
+    param(
+        $SkuPartNumber,
+        $Get_Status
+    )
+    [int32]$counter     = $null
+    [int32]$counters    = $null
+
+    if (($null -eq $SkuPartNumber) -and ($null -eq $Get_Status)){
+        Write-Error "There are no parameters filled in!"
+    }
+    if ($null -ne $SkuPartNumber){
+        foreach ($item in $Excel){
+            if ($item.input -eq $SkuPartNumber){  
+                $item.output
+            }
+            if ($item.input -notcontains $SkuPartNumber){
+                $counters = [int32]$counter++
+            
+            
+                If ($counter -eq 19) {
+                    Write-Host "$($SkuPartnumber) is not equal to $($item.output) in $($Customer.Name)"
+                }
+            }
+        } 
+    }
+    if ($null -ne $Get_Status){
+        foreach ($item in $Excel){
+            if ($item.input -eq $Get_Status){  
+                $item.status
+            }
+        }
+    }
+}
+
+
+# Going through every Customer.
+foreach ($Customer in $Customers){
+
+    # Gathering the Lisences.
+    $Licenses = Get-MsolAccountSku -TenantId $Customer.TenantId
+
+    # Going through every License.
+    foreach ($License in $Licenses){
+
+        if ((LicenseSort -Get_Status $License.SkuPartNumber) -eq "Paid"){
+            # If the consumed licenses are not eqeul to the active license then put them in an array.
+            if ($License.ConsumedUnits -ne $License.ActiveUnits){
+                $AvailableUnits = [pscustomobject][ordered]@{
+                    Customer        = $Customer.Name
+                    License         = LicenseSort -SkuPartNumber $License.SkuPartNumber
+                    ActiveUnits     = $License.ActiveUnits
+                    ConsumedUnits   = $License.ConsumedUnits
+                }
+            $InactiveLicenses += $AvailableUnits
+            }
+            
+                # Put every license with customer name and units into an array.
+                $MicrosoftArray = [pscustomobject][ordered]@{
+                    Customer        = $Customer.Name
+                    License         = LicenseSort -SkuPartNumber $License.SkuPartNumber
+                    Units           = $License.ActiveUnits
+                    MicrosoftID     = $Customer.TenantId
+                }
+            $MicrosoftArrayLicenses += $MicrosoftArray 
+        }
+    }
+}
+#==================AutoTask==================#
+
+#Download and install the module
+Install-Module Autotask
+
+if ($null -eq (get-AtwsModuleConfiguration)){
+
+    # Connect to the Autotask Web Services API (Only run this the first time, after that comment the line!)
+    $Credential = Get-Credential -Message "Please enter your AutoTask API credentials."
+    $ApiKey = '<API KEY>'
+
+    #Login into AutoTask (Only run this the first time, after that comment the line!)
+    Connect-AtwsWebAPI -Credential $Credential -ApiTrackingIdentifier $ApiKey 
+
+    # Save your credentials locally (NB! Will be exported as SecureString in CliXML) (Only run this the first time, after that comment the line!)
+    New-AtwsModuleConfiguration -Credential $Credential -SecureTrackingIdentifier ($ApiKey | ConvertTo-SecureString -AsPlainText -Force) -ProfileName Default
+}
+#Login into AutoTask with the stored credentials.
+Connect-AtwsWebAPI -ProfileName 'Default'
+
+# Gathering the contracts with the name Office 365 Business.
+$Contracts = Get-AtwsContract -ContractType 'Recurring Service' -ContractName 'Office 365 Business' -Status 'Active'
+
+# Gathering all active tenant names.
+$Tenants = Get-AtwsAccount -id $Contracts.AccountID | Sort-Object -property @{Expression = {$_.AccountName}} | Where-Object {$_.Active -eq $True}
+
+# Empty the array.
+[array]$AutoTaskArray       = $null
+[array]$ExpiredContracts    = $null
+[array]$ExpiredTenants      = $null
+
+# Getting the current date.
+$currentdate = Get-date -Hour 0 -Minute 0 -Second 0 -Millisecond 0 
+# Getting the date from a month ago.
+$PastMonth = $currentdate.AddDays(-31)
+
+foreach($Tenant in $Tenants){
+    Write-Host $tenant.AccountName -ForegroundColor Cyan
+
+    # Gathering the contract off the specific tenant.
+    $TenantContract = $Contracts | Where-Object -Property AccountID -eq $Tenant.id
+
+    # Gathering the Services in the contract.
+    $ContractService = Get-AtwsContractService -ContractID $TenantContract.id 
+
+    # Gathering the Service name.
+    $ServiceNames = Get-AtwsService -id $ContractService.ServiceID
+
+    # Going through every Service.
+    foreach($ServiceName in $ServiceNames){
+
+        # Gathering the amount of units to every service.
+        $ContractServiceUnits = Get-AtwsContractServiceUnit -ServiceID $ServiceName.id -ContractID $ContractService.ContractID -ContractServiceID $ContractService.id | Where-Object {$_.StartDate -le $currentdate -and $_.EndDate -ge $currentdate}
+        foreach ($ContractServiceUnit in $ContractServiceUnits){
+
+            $AutoTaskObject = [pscustomobject][ordered]@{
+                Customer     = $tenant.AccountName
+                License      = $ServiceName.Name
+                Units        = $ContractServiceUnit.units 
+                MicrosoftID  = $tenant.'#MicrosoftID'
+            }
+            $AutoTaskArray += $AutoTaskObject
+        }   
+    }
+}
+
+# Getting the contract that expired past month.
+$ExpiredContracts += Get-AtwsContract -ContractType 'Recurring Service' -ContractName 'Office 365 Business' -Status 'Inactive' | Where-Object {($_.EndDate -ge $PastMonth) -and ($_.EndDate -le $currentdate)} 
+foreach ($ExpiredContract in $ExpiredContracts) {
+    $ExpiredAccount = Get-AtwsAccount -id $ExpiredContract.AccountID
+
+    $AutoTaskObject = [pscustomobject][ordered]@{
+        Customer     =  $ExpiredAccount.AccountName 
+    }
+    $ExpiredTenants += $AutoTaskObject
+}
+#=====================Compare=====================#
+
+# Funtion to read-out the status from the license if it's Paid or Free.
+function LicenseStatus{
+
+    param(
+        $License
+    )
+
+    foreach ($item in $Excel){
+        if ($item.output -eq $License){  
+            $item.status
+        }
+    }
+}
+
+
+[array]$ComparedLicenses    = $null
+[array]$NotinAutotask       = $null
+[array]$NotinMicrosoft      = $null
+
+foreach ($Tenant in $Tenants) {
+
+    foreach ($Customer in $Customers) {
+
+        # If the Microsoft Id's are the same on Autotask(User Defined Field).
+        if ($Tenant.'#MicrosoftID' -match $Customer.TenantId) {
+            
+            # Create array with the matched customers.
+            $CurrentAutoTaskTenant = $AutoTaskArray | Where-Object {$_.MicrosoftID  -eq $tenant.'#MicrosoftID'}
+            $CurrentMicroCustomer = $MicrosoftArrayLicenses | Where-Object {$_.MicrosoftID  -eq $Customer.TenantId}
+
+            foreach ($CATT in $CurrentAutoTaskTenant) {
+
+                foreach ($CMC in $CurrentMicroCustomer) {
+
+                    if ($CATT.License -eq $CMC.License) {
+
+                        if ($CATT.Units -ne $CMC.Units) {
+
+                            # Get all Tenants from Autotask that have the same Microsoft ID as the current Autotask Tenant.
+                            [array]$DoubleID = $null
+                            $DoubleID = $Tenants | Where-Object {$_.'#MicrosoftID' -eq $Tenant.'#MicrosoftID'}
+
+                            # If there is more than 1 Tenant with the same Microsoft ID and there are more licenses with the same name count them up.
+                            if ($DoubleID.count -gt 1) {
+
+                                [array]$output1 = $AutoTaskArray | Where-Object {$_.MicrosoftID -eq $Tenant.'#MicrosoftID'}
+                                [array]$output2 = $output1 | Group-Object -Property License | Where-Object -FilterScript {$_.Count -gt 1} | Select-Object -ExpandProperty Group
+                                [array]$output3 = $output2 | Where-Object {$_.license -eq $CATT.License}
+                                [int32]$DoubleIDUnit = [int32]$output3.units[0] + [int32]$output3.units[1]
+
+                                if ($output2.license -eq $CMC.License) {
+
+                                    if ($DoubleIDUnit -ne $CMC.Units) {
+                                        $CompareObject = [pscustomobject][ordered]@{
+                                            Customer            = $CATT.Customer
+                                            License             = $CATT.License
+                                            AutoTaskUnits       = $DoubleIDUnit
+                                            MicrosoftUnits      = $CMC.Units
+                                        }
+                                        $ComparedLicenses += $CompareObject
+                                    }
+                                }
+                            }
+                            else{
+                                $CompareObject = [pscustomobject][ordered]@{
+                                    Customer            = $CATT.Customer
+                                    License             = $CATT.License
+                                    AutoTaskUnits       = $CATT.Units
+                                    MicrosoftUnits      = $CMC.Units
+                                }
+                                $ComparedLicenses += $CompareObject
+                            }
+                        }
+                    }
+                    # If the Microsoft license is not in Autotask then put results in array.
+                    if (($CMC.License -notin $CurrentAutoTaskTenant.license)) {
+                        
+                        if ((LicenseStatus -License $CMC.License) -eq "Paid") {
+
+                            if ($CMC.Units -ne 0){
+                            
+                                $AutoTaskObject = [pscustomobject][ordered]@{
+                                    AutotaskCustomer   = $CMC.Customer
+                                    License            = $CMC.License
+                                    Units              = $CMC.Units
+                                    Status             = LicenseStatus -License $CMC.License
+                                }
+                                # If the array is empty fill it.
+                                if ($null -eq $NotinAutotask) {
+                                    $NotinAutotask += $AutoTaskObject
+                                    }
+                                # If the last item in the array is not the same as the current then put in array. 
+                                elseif ($NotinAutotask.count -ge 1) {
+                                    $NotinAutotask += $AutoTaskObject
+                                }
+                            }
+                        }
+                    }
+                }
+                # If the Autotask license is not in Microsoft then put results in array.
+                if (($CATT.License -notin $CurrentMicroCustomer.license)) {
+
+                    if ($CATT.Units -ne 0) {
+
+                        $MicrosoftObject = [pscustomobject][ordered]@{
+                            MicrosoftCustomer   = $CATT.Customer
+                            License             = $CATT.License
+                            Units               = $CATT.Units
+                            Status              = LicenseStatus -License $CATT.License
+                        } 
+                        # If the array is empty fill it. 
+                        if ($null -eq $NotinMicrosoft) {
+                        $NotinMicrosoft += $MicrosoftObject
+                        }
+                        # If the last item in the array is not the same as the current then put in array.
+                        elseif ($NotinMicrosoft.count -ge 1) {
+                            $NotinMicrosoft += $MicrosoftObject
+                        }
+                    }
+                }  
+            }
+        }
+    }
+}
+
+#==================Report==================#
+
+# The collumn style for the arrays.
+$htmlhead = "<style>"
+$htmlhead = $htmlhead + "BODY{background-color:White;}"
+$htmlhead = $htmlhead + "TABLE{border-width: 1px;border-style: solid;border-color: black;}"
+$htmlhead = $htmlhead + "TH{border-width: 1px;padding: 0px;border-style: solid;border-color: black;}"
+$htmlhead = $htmlhead + "TD{border-width: 1px;padding: 0px;border-style: solid;border-color: black;}"
+$htmlhead = $htmlhead + "</style>"
+
+# Chech if the varible has value. Yes: Convert the arrays to HTML. No: Put out text. 
+
+if ($null -eq $ComparedLicenses){
+
+    [string]$Mail_ComparedLicenses =  ConvertTo-Html -body '<p style="font-family: Arial, sans-serif;">Er zijn geen verschillen gevonden tussen de Microsoft licenties en de AutoTask contracten.</p>'
+}
+else{
+    [string]$Mail_ComparedLicenses  = $ComparedLicenses | Select-Object Customer, License, AutoTaskUnits, MicrosoftUnits | ConvertTo-Html -Head $htmlhead 
+}
+
+if ($null -eq $ExpiredTenants){
+
+    [string]$Mail_ExpiredTenants =  ConvertTo-Html -body '<p style="font-family: Arial, sans-serif;">Er zijn geen contracten verlopen.</p>'
+}
+else{
+    [string]$Mail_ExpiredTenants  = $ExpiredTenants | Select-Object Customer, " " | ConvertTo-Html -Head $htmlhead
+}
+
+if ($null -eq $InactiveLicenses){
+
+    [string]$Mail_InactiveLicenses =  ConvertTo-Html -body '<p style="font-family: Arial, sans-serif;">Alle licenties worden momenteel gebruikt.</p>'
+}
+else{
+    [string]$Mail_InactiveLicenses  = $InactiveLicenses | Select-Object Customer, License, ActiveUnits, ConsumedUnits | ConvertTo-Html -Head $htmlhead 
+}
+
+if ($null -eq $NotinMicrosoft){
+
+    [string]$Mail_NotinMicrosoft =  ConvertTo-Html -body '<p style="font-family: Arial, sans-serif;">Alle contracten van Autotask komen overheen met de licenties van Microsoft.</p>'
+}
+else{
+    [string]$Mail_NotinMicrosoft    = $NotinMicrosoft   | Select-Object MicrosoftCustomer, License, Units, Status | ConvertTo-Html -Head $htmlhead 
+}
+
+if ($null -eq $NotinAutotask){
+
+    [string]$Mail_NotinAutotask =  ConvertTo-Html -body '<p style="font-family: Arial, sans-serif;">Alle licenties van Microsoft komen overheen met de contracten van AutoTask.</p>'
+}
+else{
+    [string]$Mail_NotinAutotask     = $NotinAutotask    | Select-Object AutotaskCustomer, License, Units, Status | ConvertTo-Html -Head $htmlhead 
+}
+
+
+# The mail layout.
+$my_html = @'
+<html>
+   <head></head>
+    <body>
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <h2 class="size-21" style=" text-align: center; letter-spacing: 2px; text-transform: uppercase; font-family: Arial, sans-serif;">Microsoft & AutoTask Report</h2>
+
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <h2 class="size-16" style="font-family: Arial, sans-serif;"><b>Verschillen tussen Microsoft en Autotask Licenties.</b></h2>
+
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <p style="font-family: Arial, sans-serif;">{2}</p>
+
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <h2 class="size-16" style="font-family: Arial, sans-serif;"><b>Licenties die niet in Microsoft zitten.</b></h2>
+    
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <p style="font-family: Arial, sans-serif;">{3}</p>
+
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <h2 class="size-16" style="font-family: Arial, sans-serif;"><b>Licenties die niet in Autotask zitten.</b></h2>
+    
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <p style="font-family: Arial, sans-serif;">{4}</p>
+
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <h2 class="size-16" style="font-family: Arial, sans-serif;"><b>Inactieve Microsoft licenties.</b></h2>
+
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <p style="font-family: Arial, sans-serif;">{1}</p>
+
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full"> </div>
+        <h2 class="size-16" style="font-family: Arial, sans-serif;"><b>Verlopen Autotask contracten.</b></h2>
+
+        <div class="row clearfix" draggable="false"> </div>
+        <div class="column full">  </div>
+        <p style="font-family: Arial, sans-serif;">{0}</p>
+    </body>
+</html>
+'@ -f $Mail_ExpiredTenants, $Mail_InactiveLicenses, $Mail_ComparedLicenses, $Mail_NotinMicrosoft, $Mail_NotinAutotask
+
+## Define the Send-MailMessage parameters
+
+    $SmtpServer                 = 'smtp.office365.com'
+    $Port                       = '587' # or '25' if not using TLS
+    $Credential                 = $MicrosoftCredentials
+    $From                       = $MicrosoftCredentials.UserName
+    $To                         = $MicrosoftCredentials.UserName
+    $Subject                    = "MICROSOFT & AUTOTASK REPORT"
+    $Body                       = $my_html
+
+## Send the message
+Send-MailMessage -Body $body -BodyAsHtml -To $To -From $From -Port $Port -SmtpServer $SmtpServer -UseSsl -Credential $Credential -Subject $Subject
+
+$null = $MicrosoftCredentials
